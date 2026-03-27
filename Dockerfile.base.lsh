@@ -40,15 +40,7 @@ RUN curl -fsSL https://skillhub-1388575217.cos.ap-guangzhou.myqcloud.com/install
 
 # 安装机器人
 
-# QQ机器人:
-#1.安装OpenClaw开源社区QQBot插件
-#openclaw plugins install @tencent-connect/openclaw-qqbot@latest
-#2.配置绑定当前QQ机器人
-#openclaw channels add --channel qqbot --token "1903602490:9mP3hM2iP6oWFyiSDzlYL9xmbRH80sle"
 
-# 微信机器人 
-# RUN npx -y @tencent-weixin/openclaw-weixin-cli@latest install 
-# 扫码授权 openclaw channels login --channel openclaw-weixin
 
 
 HEALTHCHECK --interval=3m --timeout=10s --start-period=15s --retries=3 \
