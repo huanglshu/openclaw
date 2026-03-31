@@ -1,0 +1,48 @@
+FROM openclaw:20260323-2-base
+
+ARG OPENCLAW_HTTP_PROXY="http://10.10.9.104:7890"
+ARG OPENCLAW_NPM_REGISTRY="https://registry.npmmirror.com/"
+
+
+
+# 切换到淘宝镜像源（最新官方地址）
+RUN npm config set registry $OPENCLAW_NPM_REGISTRY
+
+
+ARG OPENCLAW_DOCKER_NPM_PACKAGES="@jackwener/opencli"
+RUN npm install -g $OPENCLAW_DOCKER_NPM_PACKAGES
+
+
+ARG OPENCLAW_DOCKER_APT_PACKAGES=""
+RUN --mount=type=cache,id=openclaw-bookworm-apt-cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=openclaw-bookworm-apt-lists,target=/var/lib/apt,sharing=locked \
+    if [ -n "$OPENCLAW_DOCKER_APT_PACKAGES" ]; then \
+    apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $OPENCLAW_DOCKER_APT_PACKAGES; \
+    fi
+
+
+ENV VIRTUAL_ENV="/home/node/.openclaw/python-venv"
+ENV PIP_CONFIG_FILE=${VIRTUAL_ENV}/.pip/pip.conf
+ENV PATH=${VIRTUAL_ENV}/bin:/home/node/.local/bin:${PATH}
+
+COPY my_openclaw_setup.sh /home/node/my_openclaw_setup.sh
+RUN chmod +x /home/node/my_openclaw_setup.sh
+
+USER node
+
+# 切换到淘宝镜像源（最新官方地址）
+RUN npm config set registry $OPENCLAW_NPM_REGISTRY
+
+# 安装skillhub
+RUN curl -fsSL https://skillhub-1388575217.cos.ap-guangzhou.myqcloud.com/install/install.sh | bash
+
+
+# 安装机器人
+
+
+
+
+HEALTHCHECK --interval=3m --timeout=10s --start-period=15s --retries=3 \
+    CMD node -e "fetch('http://127.0.0.1:18789/healthz').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+CMD ["node", "openclaw.mjs", "gateway", "--allow-unconfigured"]
