@@ -1,19 +1,32 @@
-FROM openclaw:20260323-2-base
+FROM  openclaw:20260328-base
 
 ARG OPENCLAW_HTTP_PROXY="http://10.10.9.104:7890"
 ARG OPENCLAW_NPM_REGISTRY="https://registry.npmmirror.com/"
-
 
 
 # 切换到淘宝镜像源（最新官方地址）
 RUN npm config set registry $OPENCLAW_NPM_REGISTRY
 
 
-ARG OPENCLAW_DOCKER_NPM_PACKAGES="@jackwener/opencli"
-RUN npm install -g $OPENCLAW_DOCKER_NPM_PACKAGES
+
+# Optionally install Chromium and Xvfb for browser automation.
+# Build with: docker build --build-arg OPENCLAW_INSTALL_BROWSER=1 ...
+# Adds ~300MB but eliminates the 60-90s Playwright install on every container start.
+# Must run after node_modules COPY so playwright-core is available.
+ARG OPENCLAW_INSTALL_BROWSER="1"
+RUN --mount=type=cache,id=openclaw-bookworm-apt-cache,target=/var/cache/apt,sharing=locked \
+  --mount=type=cache,id=openclaw-bookworm-apt-lists,target=/var/lib/apt,sharing=locked \
+  if [ -n "$OPENCLAW_INSTALL_BROWSER" ]; then \
+  apt-get update && \
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xvfb && \
+  mkdir -p /home/node/.cache/ms-playwright && \
+  HTTP_PROXY=http://10.10.9.104:7890 PLAYWRIGHT_BROWSERS_PATH=/home/node/.cache/ms-playwright \
+  node /app/node_modules/playwright-core/cli.js install --with-deps chromium && \
+  chown -R node:node /home/node/.cache/ms-playwright; \
+  fi
 
 
-ARG OPENCLAW_DOCKER_APT_PACKAGES=""
+ARG OPENCLAW_DOCKER_APT_PACKAGES="net-tools"
 RUN --mount=type=cache,id=openclaw-bookworm-apt-cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,id=openclaw-bookworm-apt-lists,target=/var/lib/apt,sharing=locked \
     if [ -n "$OPENCLAW_DOCKER_APT_PACKAGES" ]; then \
@@ -22,12 +35,11 @@ RUN --mount=type=cache,id=openclaw-bookworm-apt-cache,target=/var/cache/apt,shar
     fi
 
 
-ENV VIRTUAL_ENV="/home/node/.openclaw/python-venv"
-ENV PIP_CONFIG_FILE=${VIRTUAL_ENV}/.pip/pip.conf
-ENV PATH=${VIRTUAL_ENV}/bin:/home/node/.local/bin:${PATH}
+ARG OPENCLAW_DOCKER_NPM_PACKAGES="@jackwener/opencli"
+RUN npm install -g $OPENCLAW_DOCKER_NPM_PACKAGES
 
-COPY my_openclaw_setup.sh /home/node/my_openclaw_setup.sh
-RUN chmod +x /home/node/my_openclaw_setup.sh
+
+ENV PATH=/home/node/.local/bin:${PATH}
 
 USER node
 
@@ -36,11 +48,6 @@ RUN npm config set registry $OPENCLAW_NPM_REGISTRY
 
 # 安装skillhub
 RUN curl -fsSL https://skillhub-1388575217.cos.ap-guangzhou.myqcloud.com/install/install.sh | bash
-
-
-# 安装机器人
-
-
 
 
 HEALTHCHECK --interval=3m --timeout=10s --start-period=15s --retries=3 \
