@@ -1,6 +1,6 @@
 添加原仓库（upstream）：
 获取原仓库的更新（包括标签）
-git remote add upstream https://github.com/openClaw/openClaw.git
+git remote add upstream git@github.com:openclaw/openclaw.git
 git fetch upstream
 获取标签和更新：
 git fetch --tags upstream
