@@ -8,3 +8,5 @@ git fetch --tags upstream
 git push origin --tags
 合并原仓库的更改（如果需要）：
 git merge upstream/main
+基础推送（本地 main → 远程 main）
+git push origin main
