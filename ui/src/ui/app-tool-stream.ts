@@ -1,4 +1,17 @@
+// Control UI module implements app tool stream behavior.
+import { stripInlineDirectiveTagsForDelivery } from "../../../src/utils/directive-tags.js";
+import { updateActivityFromToolEvent, type ActivityEntry } from "./activity-model.ts";
+import { createChatModelOverride } from "./chat-model-ref.ts";
+import type { ChatModelOverride } from "./chat-model-ref.types.ts";
+import type { ChatStreamSegment } from "./chat/stream-text.ts";
 import { formatUnknownText, truncateText } from "./format.ts";
+import {
+  buildAgentMainSessionKey,
+  DEFAULT_AGENT_ID,
+  DEFAULT_MAIN_KEY,
+  normalizeAgentId,
+  parseAgentSessionKey,
+} from "./session-key.ts";
 import { normalizeLowercaseStringOrEmpty } from "./string-coerce.ts";
 
 const TOOL_STREAM_LIMIT = 50;
@@ -11,7 +24,19 @@ export type AgentEventPayload = {
   stream: string;
   ts: number;
   sessionKey?: string;
+  agentId?: string;
   data: Record<string, unknown>;
+};
+
+export type SessionOperationEventPayload = {
+  operationId?: string;
+  operation?: string;
+  phase?: string;
+  sessionKey?: string;
+  agentId?: string;
+  ts?: number;
+  completed?: boolean;
+  reason?: string;
 };
 
 export type ToolStreamEntry = {
@@ -28,14 +53,29 @@ export type ToolStreamEntry = {
 
 type ToolStreamHost = {
   sessionKey: string;
+  assistantAgentId?: string | null;
+  agentsList?: { defaultId?: string | null } | null;
+  hello?: {
+    snapshot?: {
+      sessionDefaults?: SessionDefaultsSnapshot;
+    };
+  } | null;
   chatRunId: string | null;
   chatStream: string | null;
   chatStreamStartedAt: number | null;
-  chatStreamSegments: Array<{ text: string; ts: number }>;
+  chatStreamSegments: ChatStreamSegment[];
   toolStreamById: Map<string, ToolStreamEntry>;
   toolStreamOrder: string[];
   chatToolMessages: Record<string, unknown>[];
+  activityEntries?: ActivityEntry[];
   toolStreamSyncTimer: number | null;
+  chatModelOverrides?: Record<string, ChatModelOverride | null>;
+};
+
+type SessionDefaultsSnapshot = {
+  defaultAgentId?: string;
+  mainKey?: string;
+  mainSessionKey?: string;
 };
 
 function toTrimmedString(value: unknown): string | null {
@@ -175,6 +215,158 @@ function formatToolOutput(value: unknown): string | null {
   return `${truncated.text}\n\n… truncated (${truncated.total} chars, showing first ${truncated.text.length}).`;
 }
 
+function readRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : null;
+}
+
+function resolveSessionStatusModelOverride(result: unknown): ChatModelOverride | null | undefined {
+  const details = readRecord(readRecord(result)?.details);
+  if (!details || details.changedModel !== true) {
+    return undefined;
+  }
+  if (Object.hasOwn(details, "modelOverride")) {
+    const override = toTrimmedString(details.modelOverride);
+    return override ? createChatModelOverride(override) : null;
+  }
+  const model = toTrimmedString(details.model);
+  if (!model) {
+    return undefined;
+  }
+  const provider = toTrimmedString(details.modelProvider);
+  return createChatModelOverride(provider ? `${provider}/${model}` : model);
+}
+
+function syncSessionStatusModelOverride(host: ToolStreamHost, data: Record<string, unknown>) {
+  if (!host.chatModelOverrides) {
+    return;
+  }
+  const result = data.result;
+  const details = readRecord(readRecord(result)?.details);
+  const targetSessionKey = toTrimmedString(details?.sessionKey) ?? host.sessionKey;
+  if (
+    !sessionKeyMatchesHost(host, targetSessionKey, toTrimmedString(details?.agentId) ?? undefined)
+  ) {
+    return;
+  }
+  const override = resolveSessionStatusModelOverride(result);
+  if (override === undefined) {
+    return;
+  }
+  host.chatModelOverrides = {
+    ...host.chatModelOverrides,
+    [targetSessionKey]: override,
+  };
+}
+
+function readSessionDefaults(host: ToolStreamHost): SessionDefaultsSnapshot | undefined {
+  return host.hello?.snapshot?.sessionDefaults;
+}
+
+function isGlobalSessionKey(sessionKey: string | undefined | null): boolean {
+  return normalizeLowercaseStringOrEmpty(sessionKey) === "global";
+}
+
+function resolveDefaultAgentId(host: ToolStreamHost): string {
+  const defaults = readSessionDefaults(host);
+  return normalizeAgentId(
+    toTrimmedString(host.agentsList?.defaultId) ??
+      toTrimmedString(defaults?.defaultAgentId) ??
+      DEFAULT_AGENT_ID,
+  );
+}
+
+function resolveSelectedAgentId(host: ToolStreamHost): string {
+  return normalizeAgentId(toTrimmedString(host.assistantAgentId) ?? resolveDefaultAgentId(host));
+}
+
+function agentEventScopeMatches(host: ToolStreamHost, payload: AgentEventPayload): boolean {
+  if (!isGlobalSessionKey(host.sessionKey) || !isGlobalSessionKey(payload.sessionKey)) {
+    return true;
+  }
+  const payloadAgentId = toTrimmedString(payload.agentId);
+  const selectedAgentId = resolveSelectedAgentId(host);
+  return payloadAgentId
+    ? normalizeAgentId(payloadAgentId) === selectedAgentId
+    : selectedAgentId === resolveDefaultAgentId(host);
+}
+
+function resolveAgentMainAliasAgentId(host: ToolStreamHost, value?: string): string | null {
+  const parsed = parseAgentSessionKey(value);
+  if (!parsed) {
+    return null;
+  }
+  const defaults = readSessionDefaults(host);
+  const mainKey = toTrimmedString(defaults?.mainKey) ?? DEFAULT_MAIN_KEY;
+  const rest = normalizeLowercaseStringOrEmpty(parsed.rest);
+  return rest === DEFAULT_MAIN_KEY || rest === normalizeLowercaseStringOrEmpty(mainKey)
+    ? normalizeAgentId(parsed.agentId)
+    : null;
+}
+
+function selectedGlobalAliasEventMatches(
+  host: ToolStreamHost,
+  sessionKey: string,
+  agentId?: string,
+): boolean {
+  const hostAgentId = resolveAgentMainAliasAgentId(host, host.sessionKey);
+  if (!hostAgentId || !isGlobalSessionKey(sessionKey)) {
+    return false;
+  }
+  const eventAgentId = normalizeAgentId(agentId ?? resolveDefaultAgentId(host));
+  return hostAgentId === eventAgentId;
+}
+
+function sessionKeyMatchesHost(
+  host: ToolStreamHost,
+  sessionKey: string,
+  agentId?: string,
+): boolean {
+  return (
+    normalizeSessionKeyForEventComparison(host, sessionKey) ===
+      normalizeSessionKeyForEventComparison(host, host.sessionKey) ||
+    selectedGlobalAliasEventMatches(host, sessionKey, agentId)
+  );
+}
+
+function resolveDefaultMainSessionKey(host: ToolStreamHost): string {
+  const defaults = readSessionDefaults(host);
+  const configuredMain = toTrimmedString(defaults?.mainSessionKey);
+  if (configuredMain) {
+    return configuredMain;
+  }
+  return buildAgentMainSessionKey({
+    agentId: toTrimmedString(defaults?.defaultAgentId) ?? DEFAULT_AGENT_ID,
+    mainKey: toTrimmedString(defaults?.mainKey) ?? DEFAULT_MAIN_KEY,
+  });
+}
+
+function normalizeSessionKeyForEventComparison(
+  host: ToolStreamHost,
+  value?: string,
+): string | null {
+  const raw = toTrimmedString(value);
+  if (!raw) {
+    return null;
+  }
+  const defaults = readSessionDefaults(host);
+  const mainKey = toTrimmedString(defaults?.mainKey) ?? DEFAULT_MAIN_KEY;
+  const defaultAgentId = toTrimmedString(defaults?.defaultAgentId) ?? DEFAULT_AGENT_ID;
+  const canonicalMain = resolveDefaultMainSessionKey(host);
+  const aliases = new Set(
+    [
+      DEFAULT_MAIN_KEY,
+      mainKey,
+      canonicalMain,
+      buildAgentMainSessionKey({ agentId: defaultAgentId, mainKey: DEFAULT_MAIN_KEY }),
+      buildAgentMainSessionKey({ agentId: defaultAgentId, mainKey }),
+    ].map((entry) => normalizeLowercaseStringOrEmpty(entry)),
+  );
+  const normalizedRaw = normalizeLowercaseStringOrEmpty(raw);
+  return aliases.has(normalizedRaw)
+    ? normalizeLowercaseStringOrEmpty(canonicalMain)
+    : normalizedRaw;
+}
+
 function buildToolStreamMessage(entry: ToolStreamEntry): Record<string, unknown> {
   const content: Array<Record<string, unknown>> = [];
   content.push({
@@ -270,9 +462,11 @@ type CompactionHost = ToolStreamHost & {
   compactionClearTimer?: number | null;
   fallbackStatus?: FallbackStatus | null;
   fallbackClearTimer?: number | null;
+  requestUpdate?: () => void;
 };
 
 const COMPACTION_TOAST_DURATION_MS = 5000;
+const COMPACTION_ACTIVE_STALE_TIMEOUT_MS = 5 * 60_000;
 const FALLBACK_TOAST_DURATION_MS = 8000;
 
 function clearCompactionTimer(host: CompactionHost) {
@@ -282,11 +476,23 @@ function clearCompactionTimer(host: CompactionHost) {
   }
 }
 
-function scheduleCompactionClear(host: CompactionHost) {
+function scheduleCompactionClear(
+  host: CompactionHost,
+  delayMs = COMPACTION_TOAST_DURATION_MS,
+  expected?: { phase?: CompactionStatus["phase"]; runId?: string | null },
+) {
   host.compactionClearTimer = window.setTimeout(() => {
+    const current = host.compactionStatus;
+    if (expected?.phase && current?.phase !== expected.phase) {
+      return;
+    }
+    if (expected?.runId && current?.runId !== expected.runId) {
+      return;
+    }
     host.compactionStatus = null;
     host.compactionClearTimer = null;
-  }, COMPACTION_TOAST_DURATION_MS);
+    host.requestUpdate?.();
+  }, delayMs);
 }
 
 function setCompactionComplete(host: CompactionHost, runId: string) {
@@ -296,7 +502,67 @@ function setCompactionComplete(host: CompactionHost, runId: string) {
     startedAt: host.compactionStatus?.startedAt ?? null,
     completedAt: Date.now(),
   };
-  scheduleCompactionClear(host);
+  scheduleCompactionClear(host, COMPACTION_TOAST_DURATION_MS, { phase: "complete", runId });
+}
+
+export function handleSessionOperationEvent(
+  host: ToolStreamHost,
+  payload?: SessionOperationEventPayload,
+) {
+  if (!payload || payload.operation !== "compact") {
+    return;
+  }
+  const sessionKey = toTrimmedString(payload.sessionKey);
+  const agentId = toTrimmedString(payload.agentId) ?? undefined;
+  if (
+    !sessionKey ||
+    !sessionKeyMatchesHost(host, sessionKey, agentId) ||
+    !agentEventScopeMatches(host, {
+      runId: toTrimmedString(payload.operationId) ?? "",
+      seq: 0,
+      stream: "session.operation",
+      ts: typeof payload.ts === "number" ? payload.ts : Date.now(),
+      sessionKey,
+      ...(agentId ? { agentId } : {}),
+      data: {},
+    })
+  ) {
+    return;
+  }
+
+  const operationId = toTrimmedString(payload.operationId) ?? `session-compact:${sessionKey}`;
+  const compactionHost = host as CompactionHost;
+
+  if (payload.phase === "start") {
+    clearCompactionTimer(compactionHost);
+    compactionHost.compactionStatus = {
+      phase: "active",
+      runId: operationId,
+      startedAt: Date.now(),
+      completedAt: null,
+    };
+    scheduleCompactionClear(compactionHost, COMPACTION_ACTIVE_STALE_TIMEOUT_MS, {
+      phase: "active",
+      runId: operationId,
+    });
+    return;
+  }
+
+  if (payload.phase !== "end") {
+    return;
+  }
+  if (
+    compactionHost.compactionStatus?.runId &&
+    compactionHost.compactionStatus.runId !== operationId
+  ) {
+    return;
+  }
+  clearCompactionTimer(compactionHost);
+  if (payload.completed === true) {
+    setCompactionComplete(compactionHost, operationId);
+    return;
+  }
+  compactionHost.compactionStatus = null;
 }
 
 export function handleCompactionEvent(host: CompactionHost, payload: AgentEventPayload) {
@@ -313,6 +579,10 @@ export function handleCompactionEvent(host: CompactionHost, payload: AgentEventP
       startedAt: Date.now(),
       completedAt: null,
     };
+    scheduleCompactionClear(host, COMPACTION_ACTIVE_STALE_TIMEOUT_MS, {
+      phase: "active",
+      runId: payload.runId,
+    });
     return;
   }
   if (phase === "end") {
@@ -325,6 +595,10 @@ export function handleCompactionEvent(host: CompactionHost, payload: AgentEventP
         startedAt: host.compactionStatus?.startedAt ?? Date.now(),
         completedAt: null,
       };
+      scheduleCompactionClear(host, COMPACTION_ACTIVE_STALE_TIMEOUT_MS, {
+        phase: "retrying",
+        runId: payload.runId,
+      });
       return;
     }
     if (completed) {
@@ -366,7 +640,10 @@ function resolveAcceptedSession(
   },
 ): { accepted: boolean; sessionKey?: string } {
   const sessionKey = typeof payload.sessionKey === "string" ? payload.sessionKey : undefined;
-  if (sessionKey && sessionKey !== host.sessionKey) {
+  if (
+    sessionKey &&
+    !sessionKeyMatchesHost(host, sessionKey, toTrimmedString(payload.agentId) ?? undefined)
+  ) {
     return { accepted: false };
   }
   if (!host.chatRunId && options?.allowSessionScopedWhenIdle && sessionKey) {
@@ -447,8 +724,97 @@ function handleLifecycleFallbackEvent(host: CompactionHost, payload: AgentEventP
   }, FALLBACK_TOAST_DURATION_MS);
 }
 
+function readPreambleProgressEvent(
+  payload: AgentEventPayload,
+): { text: string; itemId?: string } | null {
+  if (payload.stream !== "item") {
+    return null;
+  }
+  const data = payload.data ?? {};
+  if (data.kind !== "preamble") {
+    return null;
+  }
+  const rawItemId =
+    typeof data.itemId === "string" && data.itemId.trim()
+      ? data.itemId
+      : typeof data.id === "string" && data.id.trim()
+        ? data.id
+        : null;
+  const itemId = rawItemId?.trim();
+  const progressText = normalizePreambleProgressText(data.progressText);
+  if (!progressText && !itemId) {
+    return null;
+  }
+  return {
+    text: progressText,
+    ...(itemId ? { itemId } : {}),
+  };
+}
+
+function normalizePreambleProgressText(value: unknown): string {
+  if (typeof value !== "string") {
+    return "";
+  }
+  const stripped = stripInlineDirectiveTagsForDelivery(value).text.trim();
+  const normalized = stripped.replace(/^[\s*_`~]+|[\s*_`~]+$/gu, "").trim();
+  return /^NO_REPLY$/iu.test(normalized) ? "" : stripped;
+}
+
+function handlePreambleProgressEvent(host: ToolStreamHost, payload: AgentEventPayload): boolean {
+  const progress = readPreambleProgressEvent(payload);
+  if (!progress) {
+    return false;
+  }
+  if (progress.itemId && !progress.text.trim()) {
+    host.chatStreamSegments = host.chatStreamSegments.filter(
+      (segment) => segment.itemId !== progress.itemId,
+    );
+    return true;
+  }
+  const existingIndex = progress.itemId
+    ? host.chatStreamSegments.findIndex((segment) => segment.itemId === progress.itemId)
+    : -1;
+  if (existingIndex >= 0) {
+    const existing = host.chatStreamSegments[existingIndex];
+    if (!existing) {
+      return true;
+    }
+    host.chatStreamSegments = host.chatStreamSegments.map((segment, index) =>
+      index === existingIndex ? { ...segment, text: progress.text } : segment,
+    );
+    return true;
+  }
+  const last = host.chatStreamSegments[host.chatStreamSegments.length - 1];
+  if (!progress.itemId && last && !last.toolCallId && last.text === progress.text) {
+    return true;
+  }
+  host.chatStreamSegments = [
+    ...host.chatStreamSegments,
+    {
+      text: progress.text,
+      ts: Date.now(),
+      ...(progress.itemId ? { itemId: progress.itemId } : {}),
+    },
+  ];
+  return true;
+}
+
 export function handleAgentEvent(host: ToolStreamHost, payload?: AgentEventPayload) {
   if (!payload) {
+    return;
+  }
+
+  // Filter by session only. Don't check chatRunId because the client sets it
+  // to a client-generated UUID (via generateUUID in sendChatMessage), while
+  // agent events arrive with the server's engine runId.
+  const sessionKey = typeof payload.sessionKey === "string" ? payload.sessionKey : undefined;
+  if (
+    sessionKey &&
+    !sessionKeyMatchesHost(host, sessionKey, toTrimmedString(payload.agentId) ?? undefined)
+  ) {
+    return;
+  }
+  if (!agentEventScopeMatches(host, payload)) {
     return;
   }
 
@@ -469,15 +835,11 @@ export function handleAgentEvent(host: ToolStreamHost, payload?: AgentEventPaylo
     return;
   }
 
-  if (payload.stream !== "tool") {
+  if (handlePreambleProgressEvent(host, payload)) {
     return;
   }
 
-  // Filter by session only. Don't check chatRunId because the client sets it
-  // to a client-generated UUID (via generateUUID in sendChatMessage), while
-  // tool events arrive with the server's engine runId — they can never match.
-  const sessionKey = typeof payload.sessionKey === "string" ? payload.sessionKey : undefined;
-  if (sessionKey && sessionKey !== host.sessionKey) {
+  if (payload.stream !== "tool") {
     return;
   }
 
@@ -486,6 +848,7 @@ export function handleAgentEvent(host: ToolStreamHost, payload?: AgentEventPaylo
   if (!toolCallId) {
     return;
   }
+  updateActivityFromToolEvent(host, { ...payload, data });
   const name = typeof data.name === "string" ? data.name : "tool";
   const phase = typeof data.phase === "string" ? data.phase : "";
   const args = phase === "start" ? data.args : undefined;
@@ -495,14 +858,25 @@ export function handleAgentEvent(host: ToolStreamHost, payload?: AgentEventPaylo
       : phase === "result"
         ? formatToolOutput(data.result)
         : undefined;
+  if (name === "session_status" && phase === "result") {
+    syncSessionStatusModelOverride(host, data);
+  }
 
   const now = Date.now();
   let entry = host.toolStreamById.get(toolCallId);
   if (!entry) {
     // Commit any in-progress streaming text as a segment so it renders
     // above the tool card instead of below it.
-    if (host.chatStream && host.chatStream.trim().length > 0) {
-      host.chatStreamSegments = [...host.chatStreamSegments, { text: host.chatStream, ts: now }];
+    if (
+      host.chatRunId &&
+      payload.runId === host.chatRunId &&
+      host.chatStream &&
+      host.chatStream.trim().length > 0
+    ) {
+      host.chatStreamSegments = [
+        ...host.chatStreamSegments,
+        { text: host.chatStream, ts: now, toolCallId },
+      ];
       host.chatStream = null;
       host.chatStreamStartedAt = null;
     }
